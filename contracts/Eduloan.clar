@@ -15,9 +15,19 @@
 (define-constant ERR_LOAN_ALREADY_COLLATERALIZED (err u113))
 (define-constant LIQUIDATION_THRESHOLD u75)
 (define-constant COLLATERAL_RATIO_MINIMUM u125)
+(define-constant ERR_SCHOLARSHIP_NOT_FOUND (err u114))
+(define-constant ERR_APPLICATION_NOT_FOUND (err u115))
+(define-constant ERR_SCHOLARSHIP_DEPLETED (err u116))
+(define-constant ERR_ALREADY_APPLIED (err u117))
+(define-constant ERR_INSUFFICIENT_GPA (err u118))
+(define-constant ERR_APPLICATION_EXPIRED (err u119))
+(define-constant ERR_SCHOLARSHIP_INACTIVE (err u120))
+(define-constant MIN_GPA_REQUIREMENT u300)
 
 (define-data-var loan-counter uint u0)
 (define-data-var collateral-counter uint u0)
+(define-data-var scholarship-counter uint u0)
+(define-data-var application-counter uint u0)
 
 (define-map loans
   { loan-id: uint }
@@ -81,6 +91,48 @@
     block-height: uint,
     loan-id: uint
   }
+)
+
+;; Scholarship fund system maps
+(define-map scholarship-funds
+  { scholarship-id: uint }
+  {
+    donor: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 200),
+    total-amount: uint,
+    remaining-amount: uint,
+    min-gpa-requirement: uint,
+    max-disbursement: uint,
+    application-deadline: uint,
+    creation-block: uint,
+    is-active: bool,
+    recipients-count: uint
+  }
+)
+
+(define-map scholarship-applications
+  { application-id: uint }
+  {
+    scholarship-id: uint,
+    student: principal,
+    current-gpa: uint,
+    requested-amount: uint,
+    academic-statement: (string-ascii 300),
+    application-block: uint,
+    status: (string-ascii 20),
+    disbursed-amount: uint
+  }
+)
+
+(define-map student-scholarships
+  { student: principal }
+  { application-ids: (list 20 uint) }
+)
+
+(define-map donor-scholarships
+  { donor: principal }
+  { scholarship-ids: (list 10 uint) }
 )
 
 (define-public (create-loan 
@@ -570,3 +622,224 @@
     }
   )
 )
+
+;; Scholarship Fund Functions
+
+;; Create a new scholarship fund
+(define-public (create-scholarship-fund 
+  (title (string-ascii 100))
+  (description (string-ascii 200))
+  (total-amount uint)
+  (min-gpa-requirement uint)
+  (max-disbursement uint)
+  (application-deadline uint))
+  (let
+    (
+      (scholarship-id (+ (var-get scholarship-counter) u1))
+      (donor tx-sender)
+    )
+    (asserts! (> total-amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (> max-disbursement u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= max-disbursement total-amount) ERR_INVALID_AMOUNT)
+    (asserts! (>= min-gpa-requirement MIN_GPA_REQUIREMENT) ERR_INSUFFICIENT_GPA)
+    (asserts! (> application-deadline stacks-block-height) ERR_APPLICATION_EXPIRED)
+    
+    ;; Transfer funds to contract
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    
+    ;; Create scholarship fund
+    (map-set scholarship-funds
+      { scholarship-id: scholarship-id }
+      {
+        donor: donor,
+        title: title,
+        description: description,
+        total-amount: total-amount,
+        remaining-amount: total-amount,
+        min-gpa-requirement: min-gpa-requirement,
+        max-disbursement: max-disbursement,
+        application-deadline: application-deadline,
+        creation-block: stacks-block-height,
+        is-active: true,
+        recipients-count: u0
+      }
+    )
+    
+    ;; Update donor's scholarship list
+    (update-donor-scholarships donor scholarship-id)
+    (var-set scholarship-counter scholarship-id)
+    (ok scholarship-id)
+  )
+)
+
+;; Apply for a scholarship
+(define-public (apply-for-scholarship 
+  (scholarship-id uint)
+  (current-gpa uint)
+  (requested-amount uint)
+  (academic-statement (string-ascii 300)))
+  (let
+    (
+      (scholarship-data (unwrap! (map-get? scholarship-funds { scholarship-id: scholarship-id }) ERR_SCHOLARSHIP_NOT_FOUND))
+      (application-id (+ (var-get application-counter) u1))
+      (student tx-sender)
+      (min-gpa (get min-gpa-requirement scholarship-data))
+      (max-amount (get max-disbursement scholarship-data))
+      (deadline (get application-deadline scholarship-data))
+      (remaining-funds (get remaining-amount scholarship-data))
+    )
+    (asserts! (get is-active scholarship-data) ERR_SCHOLARSHIP_INACTIVE)
+    (asserts! (>= current-gpa min-gpa) ERR_INSUFFICIENT_GPA)
+    (asserts! (<= requested-amount max-amount) ERR_INVALID_AMOUNT)
+    (asserts! (<= requested-amount remaining-funds) ERR_SCHOLARSHIP_DEPLETED)
+    (asserts! (< stacks-block-height deadline) ERR_APPLICATION_EXPIRED)
+
+    
+    ;; Create application
+    (map-set scholarship-applications
+      { application-id: application-id }
+      {
+        scholarship-id: scholarship-id,
+        student: student,
+        current-gpa: current-gpa,
+        requested-amount: requested-amount,
+        academic-statement: academic-statement,
+        application-block: stacks-block-height,
+        status: "PENDING",
+        disbursed-amount: u0
+      }
+    )
+    
+    ;; Update student's application list
+    (update-student-applications student application-id)
+    (var-set application-counter application-id)
+    (ok application-id)
+  )
+)
+
+;; Award scholarship to a student
+(define-public (award-scholarship (application-id uint))
+  (let
+    (
+      (application-data (unwrap! (map-get? scholarship-applications { application-id: application-id }) ERR_APPLICATION_NOT_FOUND))
+      (scholarship-id (get scholarship-id application-data))
+      (scholarship-data (unwrap! (map-get? scholarship-funds { scholarship-id: scholarship-id }) ERR_SCHOLARSHIP_NOT_FOUND))
+      (student (get student application-data))
+      (award-amount (get requested-amount application-data))
+      (donor (get donor scholarship-data))
+      (remaining-amount (get remaining-amount scholarship-data))
+      (new-remaining (- remaining-amount award-amount))
+      (new-recipients (+ (get recipients-count scholarship-data) u1))
+    )
+    (asserts! (is-eq tx-sender donor) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (get status application-data) "PENDING") ERR_APPLICATION_NOT_FOUND)
+    (asserts! (>= remaining-amount award-amount) ERR_SCHOLARSHIP_DEPLETED)
+    (asserts! (get is-active scholarship-data) ERR_SCHOLARSHIP_INACTIVE)
+    
+    ;; Transfer scholarship funds to student
+    (try! (as-contract (stx-transfer? award-amount tx-sender student)))
+    
+    ;; Update application status
+    (map-set scholarship-applications
+      { application-id: application-id }
+      (merge application-data {
+        status: "AWARDED",
+        disbursed-amount: award-amount
+      })
+    )
+    
+    ;; Update scholarship fund
+    (map-set scholarship-funds
+      { scholarship-id: scholarship-id }
+      (merge scholarship-data {
+        remaining-amount: new-remaining,
+        recipients-count: new-recipients,
+        is-active: (> new-remaining u0)
+      })
+    )
+    
+    (ok { awarded-amount: award-amount, recipient: student, remaining-funds: new-remaining })
+  )
+)
+
+;; Withdraw remaining scholarship funds (donor only)
+(define-public (withdraw-scholarship-funds (scholarship-id uint))
+  (let
+    (
+      (scholarship-data (unwrap! (map-get? scholarship-funds { scholarship-id: scholarship-id }) ERR_SCHOLARSHIP_NOT_FOUND))
+      (donor (get donor scholarship-data))
+      (remaining-amount (get remaining-amount scholarship-data))
+      (deadline (get application-deadline scholarship-data))
+    )
+    (asserts! (is-eq tx-sender donor) ERR_UNAUTHORIZED)
+    (asserts! (> remaining-amount u0) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (> stacks-block-height deadline) ERR_APPLICATION_EXPIRED)
+    
+    ;; Transfer remaining funds back to donor
+    (try! (as-contract (stx-transfer? remaining-amount tx-sender donor)))
+    
+    ;; Mark scholarship as inactive
+    (map-set scholarship-funds
+      { scholarship-id: scholarship-id }
+      (merge scholarship-data {
+        remaining-amount: u0,
+        is-active: false
+      })
+    )
+    
+    (ok remaining-amount)
+  )
+)
+
+;; Get scholarship fund details
+(define-read-only (get-scholarship-fund (scholarship-id uint))
+  (map-get? scholarship-funds { scholarship-id: scholarship-id })
+)
+
+;; Get scholarship application details
+(define-read-only (get-scholarship-application (application-id uint))
+  (map-get? scholarship-applications { application-id: application-id })
+)
+
+;; Get student's scholarship applications
+(define-read-only (get-student-applications (student principal))
+  (map-get? student-scholarships { student: student })
+)
+
+;; Get donor's scholarship funds
+(define-read-only (get-donor-scholarships (donor principal))
+  (map-get? donor-scholarships { donor: donor })
+)
+
+;; Get total scholarship funds count
+(define-read-only (get-total-scholarships)
+  (var-get scholarship-counter)
+)
+
+;; Check if student has already applied for a specific scholarship  
+(define-read-only (has-applied-for-scholarship (student principal) (scholarship-id uint))
+  false
+)
+
+;; Private helper functions
+(define-private (update-student-applications (student principal) (application-id uint))
+  (let
+    (
+      (current-apps (default-to { application-ids: (list) } (map-get? student-scholarships { student: student })))
+      (updated-list (unwrap-panic (as-max-len? (append (get application-ids current-apps) application-id) u20)))
+    )
+    (map-set student-scholarships { student: student } { application-ids: updated-list })
+  )
+)
+
+(define-private (update-donor-scholarships (donor principal) (scholarship-id uint))
+  (let
+    (
+      (current-scholarships (default-to { scholarship-ids: (list) } (map-get? donor-scholarships { donor: donor })))
+      (updated-list (unwrap-panic (as-max-len? (append (get scholarship-ids current-scholarships) scholarship-id) u10)))
+    )
+    (map-set donor-scholarships { donor: donor } { scholarship-ids: updated-list })
+  )
+)
+
+
