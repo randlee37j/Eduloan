@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/Eduloan.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.credit-scoring]
+path = 'contracts/credit-scoring.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
